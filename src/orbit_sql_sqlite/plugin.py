@@ -13,11 +13,12 @@
 # limitations under the License.
 """Optional Core plugin wiring the standalone SQLite provider resource."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from orbit import Application
-from orbit.plugins import Plugin, PluginMetadata
+from orbit.plugins import ControlAction, ControlResult, Plugin, PluginMetadata
 from orbit_sql import SQL_DATABASE_KEY
 
 from orbit_sql_sqlite.config import SQLiteConfig
@@ -38,6 +39,14 @@ class SQLitePlugin(Plugin):
         if not isinstance(config, SQLiteConfig):
             raise TypeError("SQLitePlugin requires SQLiteConfig.")
         self._config = config
+        self.control_actions = (
+            ControlAction(
+                id="check-connection",
+                title="Check SQLite database",
+                description="Run a read-only SELECT 1 and close the temporary database resource.",
+                handler=self._check_connection,
+            ),
+        )
 
     def setup(self, application: Application) -> None:
         """Register a managed resource factory during plugin setup."""
@@ -56,6 +65,16 @@ class SQLitePlugin(Plugin):
             yield database
         finally:
             await database.aclose()
+
+    async def _check_connection(self, _: Mapping[str, object]) -> ControlResult:
+        """Run a bounded, read-only local database check and release its worker."""
+        database_path = self._config.database_path
+        if database_path != ":memory:" and not Path(database_path).is_file():
+            return ControlResult("SQLite database file does not exist.", succeeded=False)
+        async with self._database() as database:
+            await database.execute("PRAGMA query_only = ON")
+            await database.fetch_one("SELECT 1")
+        return ControlResult("SQLite database is reachable.")
 
 
 __all__ = ["SQLitePlugin"]

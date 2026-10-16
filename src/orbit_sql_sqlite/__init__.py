@@ -16,6 +16,5 @@
 from orbit_sql_sqlite.adapter import SQLiteAdapter
 from orbit_sql_sqlite.config import SQLiteConfig
 from orbit_sql_sqlite.database import SQLiteDatabase
-from orbit_sql_sqlite.plugin import SQLitePlugin
 
-__all__ = ["SQLiteAdapter", "SQLiteConfig", "SQLiteDatabase", "SQLitePlugin"]
+__all__ = ["SQLiteAdapter", "SQLiteConfig", "SQLiteDatabase"]

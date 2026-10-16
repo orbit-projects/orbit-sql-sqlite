@@ -1,47 +1,79 @@
-# Orbit SQL SQLite: operations and security
+# Orbit SQL SQLite: operations
 
-This guide organizes runtime behavior documented by the package. It does not certify production readiness. Verify provider/client versions, permissions, transport security, limits, and failure behavior in the target environment before release.
+`orbit-sql-sqlite` implements `orbit-sql` with Python's standard-library `sqlite3`. It owns one
+connection and one dedicated worker thread per `SQLiteDatabase`; the connection opens lazily on the
+first operation. It does not own a process pool or provide server-database coordination.
 
-## Configuration surface
-
-Environment names found in the package README:
-
-The package README does not name `ORBIT_*` variables. Use its typed constructors and application configuration, and confirm exact runtime inputs in the implementation before deployment.
-
-Use the package README's constructor and deployment examples. Store credentials in a secret manager and avoid logging credentials, raw provider errors, request data, or opaque cursors.
-
-## Lifecycle, failure behavior, and limits
-
-`orbit-sql-sqlite` is the local SQLite provider for the `orbit-sql` capability. It uses Python's
-standard-library `sqlite3` on a dedicated worker thread, so application calls do not block the
-event loop. Core owns only the generic application lifecycle and resource container; SQLite and SQL
-contracts are installed from this package chain.
+Install the Core runtime, SQL contract, and adapter explicitly:
 
 ```bash
-pip install orbit-core orbit-data orbit-sql orbit-sql-sqlite
+python -m pip install orbit-data orbit-sql orbit-sql-sqlite
+# Add the Core lifecycle plugin only when the application uses it:
+python -m pip install 'orbit-sql-sqlite[core]'
 ```
 
-`SQLitePlugin` registers a lazy resource at `orbit_sql.SQL_DATABASE_KEY`. It opens the connection
-on first operation and Core closes it during application shutdown. Each database object is bound to
-one event loop, serializes access on its worker, bounds result sizes and waits for submitted worker
-operations before releasing transaction locks after cancellation. Use file-backed SQLite for
-multi-connection applications; `:memory:` is scoped to one connection and one process. SQLite is
-for development, local and embedded deployments; it is not a server database or shared distributed
-store.
+## Configure the database resource
+
+`SQLiteConfig` accepts a filesystem path or the exact `:memory:` marker. The path is interpreted
+relative to the process working directory when it is relative. Use an absolute path for deployed
+applications, create and permission its parent directory before startup, and ensure the service
+user can create SQLite journal sidecar files there. This package does not create parent directories.
+
+`timeout` defaults to five seconds and controls how long SQLite waits for a conflicting file lock.
+It must be greater than zero and no more than 300 seconds. The wait occurs on the database's single
+worker thread; a long timeout can block all operations queued on that instance. Set it based on the
+application's write contention and request budget.
 
 ```python
 from orbit import Application, ApplicationConfig
-from orbit_sql_sqlite import SQLiteConfig, SQLitePlugin
+from orbit_sql_sqlite import SQLiteConfig
+from orbit_sql_sqlite.plugin import SQLitePlugin
 
 app = Application(ApplicationConfig(name="notes"))
-app.plugins.register(SQLitePlugin(SQLiteConfig(path="var/notes.sqlite")))
+app.plugins.register(SQLitePlugin(SQLiteConfig(path="/var/lib/notes/notes.sqlite", timeout=5.0)))
 ```
 
-This package is pre-alpha. Live deployment behavior depends on the host filesystem and SQLite
-build. It supports Python 3.11 through 3.14.
+The plugin registers `SQL_DATABASE_KEY` as a lazy Core-managed resource. Resolve it after startup;
+Core closes the resource during shutdown. When using `SQLiteAdapter` directly through the SQL
+registry, explicitly call `aclose()` in the application's cleanup path or manage the database with
+its async context manager. Concurrent close callers share one cleanup attempt. If a driver or
+worker shutdown error makes that attempt fail, call `aclose()` again after addressing the cause;
+the failed attempt leaves the resource closed to new queries and retains the worker when it is
+needed to retry closing the connection.
 
-Licensed under Apache-2.0.
+## Write and transaction behavior
 
-## Production validation
+Standalone writes through `database.execute()` are committed before the call returns. Use
+`async with database.transaction()` when several statements must commit or roll back together. A
+normal body exit commits. An exception or task cancellation rolls back after submitted synchronous
+SQLite work has drained from the worker thread.
 
-Validate startup/shutdown cleanup, timeout and cancellation behavior, concurrency and payload bounds where applicable, secret rotation and least-privilege access, data durability, backup/restore, and failover against the selected provider. Do not infer distributed or durable guarantees from an in-process API or fake-client tests.
+Cancellation during commit cannot undo a commit that already succeeded. If the caller observes
+cancellation or a connection error at that point, reconcile the write before retrying a
+non-idempotent operation. Use an application request ID or other deduplication key where retries
+can otherwise create duplicate effects.
+
+The connection runs with foreign-key enforcement enabled. Result reads are bounded: `fetch_all`
+raises a provider-neutral error if it finds more rows than its requested limit instead of silently
+truncating. Query text and parameter counts also have hard limits; use bound positional parameters
+for values and fixed or allowlisted identifiers.
+
+## Choose the deployment boundary
+
+A file-backed database persists across process restarts and can be opened by other local processes,
+subject to SQLite locking and filesystem behavior. Each Orbit database object still owns its own
+connection; this adapter does not pool or coordinate those connections. Keep the file on reliable
+local storage. Use a server database for multi-host writes, high write concurrency, replication, or
+centralized access control.
+
+`:memory:` is private to one SQLite connection and disappears when that database resource closes.
+It is appropriate for isolated tests and ephemeral local work. SQLite remains useful in embedded
+production deployments with modest, local workloads; validate locking, backup, restore, and disk
+failure behavior for the actual filesystem before release.
+
+## Release validation
+
+The local suite verifies transaction cleanup, cancellation draining, persistence, parameter
+binding, result limits, safe errors, and Core resource shutdown. It does not validate backup/restore,
+power-loss behavior, filesystem permissions, multi-process contention, network filesystems, or a
+production host. Review those deployment-specific properties separately.

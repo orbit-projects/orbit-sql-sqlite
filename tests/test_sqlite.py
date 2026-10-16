@@ -15,8 +15,10 @@
 
 import asyncio
 import threading
+import tomllib
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -24,6 +26,40 @@ from orbit.container import Container
 from orbit_sql import DatabaseError, SQLDatabase, SQLExecution, SQLParameters, SQLRow
 
 from orbit_sql_sqlite import SQLiteDatabase
+from orbit_sql_sqlite.config import SQLiteConfig
+from orbit_sql_sqlite.plugin import SQLitePlugin
+
+
+def test_core_lifecycle_dependency_is_optional() -> None:
+    """The SQL provider can be used without Core unless its plugin extra is installed."""
+    manifest = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    assert not any(dep.startswith("orbit-core") for dep in manifest["dependencies"])
+    assert manifest["optional-dependencies"]["core"] == ["orbit-core>=0.1.0a1,<0.2"]
+
+
+@pytest.mark.asyncio
+async def test_control_room_connection_check_uses_and_closes_a_temporary_database(
+    tmp_path,
+) -> None:
+    """The plugin contributes a read-only UI operation with explicit resource cleanup."""
+    path = tmp_path / "control.sqlite"
+    setup_database = SQLiteDatabase(path)
+    await setup_database.fetch_one("SELECT 1")
+    await setup_database.aclose()
+    plugin = SQLitePlugin(SQLiteConfig(path=str(path)))
+    action = plugin.control_actions[0]
+
+    result = await action.handler({})
+
+    assert action.id == "check-connection"
+    assert result is not None
+    assert result.summary == "SQLite database is reachable."
+    missing = SQLitePlugin(SQLiteConfig(path=str(tmp_path / "missing.sqlite")))
+    missing_result = await missing.control_actions[0].handler({})
+    assert missing_result is not None and not missing_result.succeeded
+    assert not (tmp_path / "missing.sqlite").exists()
 
 
 @pytest.fixture
@@ -49,6 +85,23 @@ async def test_sqlite_implements_shared_contract_and_parameterized_rows(database
     assert row is not None
     assert row["name"] == "Orbit"
     assert len(rows) == 1
+
+
+async def test_standalone_writes_persist_across_connection_shutdown(tmp_path) -> None:
+    """A successful write outside an explicit transaction is committed before returning."""
+    path = tmp_path / "standalone-write.sqlite"
+    first = SQLiteDatabase(path)
+    await first.execute("CREATE TABLE values_table (value INTEGER NOT NULL)")
+    await first.execute("INSERT INTO values_table VALUES ($1)", (7,))
+    await first.aclose()
+
+    second = SQLiteDatabase(path)
+    try:
+        row = await second.fetch_one("SELECT value FROM values_table")
+        assert row is not None
+        assert row["value"] == 7
+    finally:
+        await second.aclose()
 
 
 async def test_container_resource_scope_closes_sqlite_database(tmp_path) -> None:
@@ -103,6 +156,37 @@ async def test_concurrent_close_callers_wait_for_the_same_cleanup(tmp_path, monk
             await first
         if second is not None:
             await second
+
+
+async def test_failed_connection_close_can_be_retried(tmp_path, monkeypatch) -> None:
+    """A transient close error retains the worker and allows a later cleanup attempt."""
+    database = SQLiteDatabase(tmp_path / "retry-close.sqlite")
+    await database.execute("SELECT 1")
+    original_close = database._close_sync
+    attempts = 0
+
+    def fail_once_then_close() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary close failure")
+        original_close()
+
+    monkeypatch.setattr(database, "_close_sync", fail_once_then_close)
+
+    with pytest.raises(RuntimeError, match="temporary close failure"):
+        await database.aclose()
+
+    assert database._connection is not None
+    assert not database._executor._shutdown
+    with pytest.raises(DatabaseError, match="closed"):
+        await database.execute("SELECT 2")
+
+    await database.aclose()
+
+    assert attempts == 2
+    assert database._connection is None
+    assert database._executor._shutdown
 
 
 async def test_sqlite_binds_numbered_parameters_by_name_without_order_assumptions(database) -> None:

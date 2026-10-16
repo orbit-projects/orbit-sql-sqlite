@@ -81,7 +81,12 @@ class SQLiteDatabase:
         await self.aclose()
 
     async def execute(self, statement: str, parameters: SQLParameters = ()) -> SQLExecution:
-        """Run a parameterized write/DDL statement away from the event loop."""
+        """Run a parameterized statement away from the event loop.
+
+        Statements outside :meth:`transaction` use SQLite autocommit, so a successful standalone
+        write is committed before this method returns. Use the transaction context for atomic
+        multi-statement work.
+        """
         self._validate_statement(statement)
         parameters = self._normalize_parameters(parameters)
         async with self._lock:
@@ -132,9 +137,16 @@ class SQLiteDatabase:
             self._lock.release()
 
     async def aclose(self) -> None:
-        """Close SQLite once; concurrent callers share cancellation-safe cleanup completion."""
+        """Close SQLite with shared, cancellation-safe cleanup.
+
+        Concurrent callers wait for the same close attempt. If that attempt fails, a later call
+        starts a fresh attempt so transient driver or executor cleanup failures can be recovered.
+        The database rejects new operations as soon as the first close attempt begins.
+        """
         self._bind_loop()
         task = self._close_task
+        if task is not None and task.done() and (task.cancelled() or task.exception() is not None):
+            task = None
         if task is None:
             self._closed = True
             task = asyncio.create_task(self._finish_close())
@@ -151,12 +163,12 @@ class SQLiteDatabase:
 
     async def _finish_close(self) -> None:
         """Drain serialized operations, close SQLite, then stop its dedicated worker."""
-        try:
-            async with self._lock:
-                if self._connection is not None:
-                    await self._run(self._close_sync)
-        finally:
-            await asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=False)
+        async with self._lock:
+            if self._connection is not None:
+                await self._run(self._close_sync)
+        # Keep the worker available if closing the SQLite connection fails. A later aclose()
+        # can then retry that close on the same thread before shutting the executor down.
+        await asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=False)
 
     def _ensure_open(self) -> None:
         self._bind_loop()
@@ -219,7 +231,11 @@ class SQLiteDatabase:
     def _connect_sync(self) -> sqlite3.Connection:
         if self._connection is None:
             try:
-                connection = sqlite3.connect(self._path, timeout=self._timeout)
+                # Disable sqlite3's implicit DML transactions. Standalone writes then commit
+                # before execute() returns; transaction() opens its own explicit BEGIN scope.
+                connection = sqlite3.connect(
+                    self._path, timeout=self._timeout, isolation_level=None
+                )
                 connection.execute("PRAGMA foreign_keys = ON")
                 self._connection = connection
             except sqlite3.Error:
